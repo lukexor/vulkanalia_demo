@@ -1,4 +1,7 @@
 use anyhow::{anyhow, Result};
+use lazy_static::lazy_static;
+use nalgebra_glm as glm;
+use std::mem::size_of;
 use std::{collections::HashSet, ffi::CStr, os::raw::c_void};
 use thiserror::Error;
 use vulkanalia::{
@@ -14,10 +17,12 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
-const VALIDATION_ENABLED: bool = cfg!(debug_assertions); // Optional debugging
+// Optional debugging extensions
+const VALIDATION_ENABLED: bool = cfg!(debug_assertions);
 const VALIDATION_LAYER: vk::ExtensionName =
     vk::ExtensionName::from_bytes(b"VK_LAYER_KHRONOS_validation");
 
+// Required extensions for macOS
 const REQUIRED_FLAGS: InstanceCreateFlags = InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
 const REQUIRED_EXTENSIONS: &[&vk::ExtensionName] = &[
     &vk::KHR_PORTABILITY_ENUMERATION_EXTENSION.name,
@@ -25,11 +30,19 @@ const REQUIRED_EXTENSIONS: &[&vk::ExtensionName] = &[
 ];
 const DEVICE_EXTENSIONS: &[vk::ExtensionName] = &[
     vk::KHR_SWAPCHAIN_EXTENSION.name,
-    vk::KHR_PORTABILITY_SUBSET_EXTENSION.name,
+    vk::KHR_PORTABILITY_SUBSET_EXTENSION.name, // Required for macOS
 ];
 
-/// The maximum number of frames that can be processed concurrently.
+// The maximum number of frames that can be processed concurrently.
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
+lazy_static! {
+    static ref VERTICES: Vec<Vertex> = vec![
+        Vertex::new(glm::vec2(0.0, -0.5), glm::vec3(1.0, 0.0, 0.0)),
+        Vertex::new(glm::vec2(0.5, 0.5), glm::vec3(0.0, 1.0, 0.0)),
+        Vertex::new(glm::vec2(-0.5, 0.5), glm::vec3(0.0, 0.0, 1.0)),
+    ];
+}
 
 fn main() -> Result<()> {
     pretty_env_logger::init();
@@ -84,6 +97,25 @@ fn main() -> Result<()> {
     });
 }
 
+extern "system" fn debug_callback(
+    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    msg_type: vk::DebugUtilsMessageTypeFlagsEXT,
+    data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+    _: *mut c_void,
+) -> vk::Bool32 {
+    let message = unsafe { CStr::from_ptr((*data).message) }.to_string_lossy();
+    match severity {
+        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => log::error!("({:?}) {}", msg_type, message),
+        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => {
+            log::warn!("({:?}) {}", msg_type, message)
+        }
+        vk::DebugUtilsMessageSeverityFlagsEXT::INFO => log::debug!("({:?}) {}", msg_type, message),
+        _ => log::trace!("({:?}) {}", msg_type, message),
+    }
+    vk::FALSE
+}
+
+// Vulkan App
 #[derive(Debug, Clone)]
 #[must_use]
 struct App {
@@ -95,23 +127,30 @@ struct App {
     resized: bool,
 }
 
+// Vulkan handles and properties
 #[derive(Default, Debug, Clone)]
 #[must_use]
 struct AppData {
     messenger: vk::DebugUtilsMessengerEXT,
     surface: vk::SurfaceKHR,
     physical_device: vk::PhysicalDevice,
+    // Queues
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
+    // Swapchain
     swapchain_format: vk::Format,
     swapchain_extent: vk::Extent2D,
     swapchain: vk::SwapchainKHR,
     swapchain_images: Vec<vk::Image>,
     swapchain_image_views: Vec<vk::ImageView>,
+    // Pipeline
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    // Buffers
     framebuffers: Vec<vk::Framebuffer>,
+    vertex_buffer: vk::Buffer,
+    vertex_buffer_memory: vk::DeviceMemory,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
     // Sync Objects
@@ -236,11 +275,11 @@ impl App {
             layers: &[*const i8],
             indices: &QueueFamilyIndices,
         ) -> Result<Device> {
+            // Queue Infos
             let mut unique_indices = HashSet::new();
             unique_indices.insert(indices.graphics);
             unique_indices.insert(indices.present);
 
-            // Queue Infos
             let queue_priorities = &[1.0];
             let queue_infos = unique_indices
                 .iter()
@@ -288,6 +327,62 @@ impl App {
             data.command_pool = device.create_command_pool(&command_pool_info, None)?;
             Ok(())
         }
+
+        unsafe fn create_vertex_buffer(
+            instance: &Instance,
+            device: &Device,
+            data: &mut AppData,
+        ) -> Result<()> {
+            unsafe fn get_memory_type_index(
+                instance: &Instance,
+                data: &AppData,
+                properties: vk::MemoryPropertyFlags,
+                requirements: vk::MemoryRequirements,
+            ) -> Result<u32> {
+                let memory = instance.get_physical_device_memory_properties(data.physical_device);
+                (0..memory.memory_type_count)
+                    .find(|&i| {
+                        let suitable = (requirements.memory_type_bits & (1 << i)) != 0;
+                        let memory_type = memory.memory_types[i as usize];
+                        suitable && memory_type.property_flags.contains(properties)
+                    })
+                    .ok_or_else(|| anyhow!("failed to find suitable memory type."))
+            }
+
+            // Buffer
+            let buffer_info = vk::BufferCreateInfo::builder()
+                .size((size_of::<Vertex>() * VERTICES.len()) as u64)
+                .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            data.vertex_buffer = device.create_buffer(&buffer_info, None)?;
+
+            // Memory
+            let requirements = device.get_buffer_memory_requirements(data.vertex_buffer);
+
+            let memory_info = vk::MemoryAllocateInfo::builder()
+                .allocation_size(requirements.size)
+                .memory_type_index(get_memory_type_index(
+                    instance,
+                    data,
+                    vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+                    requirements,
+                )?);
+            data.vertex_buffer_memory = device.allocate_memory(&memory_info, None)?;
+            device.bind_buffer_memory(data.vertex_buffer, data.vertex_buffer_memory, 0)?;
+
+            // Copy
+            let memory = device.map_memory(
+                data.vertex_buffer_memory,
+                0,
+                buffer_info.size,
+                vk::MemoryMapFlags::empty(),
+            )?;
+            std::ptr::copy_nonoverlapping(VERTICES.as_ptr(), memory.cast(), VERTICES.len());
+            device.unmap_memory(data.vertex_buffer_memory);
+
+            Ok(())
+        }
+
         unsafe fn create_sync_objects(device: &Device, data: &mut AppData) -> Result<()> {
             let semaphor_info = vk::SemaphoreCreateInfo::builder();
             let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
@@ -332,6 +427,7 @@ impl App {
         Self::create_pipeline(&device, &mut data)?;
         Self::create_framebuffers(&device, &mut data)?;
         create_command_pool(&instance, &device, &mut data, &indices)?;
+        create_vertex_buffer(&instance, &device, &mut data)?;
         Self::create_command_buffers(&device, &mut data)?;
         create_sync_objects(&device, &mut data)?;
 
@@ -458,6 +554,9 @@ impl App {
 
         self.destroy_swapchain();
 
+        self.device.destroy_buffer(self.data.vertex_buffer, None);
+        self.device
+            .free_memory(self.data.vertex_buffer_memory, None);
         self.data
             .in_flight_fences
             .iter()
@@ -687,7 +786,11 @@ impl App {
             .name(b"main\0");
 
         // Vertex Input State
-        let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder();
+        let binding_descriptions = &[Vertex::binding_description()];
+        let attribute_descriptions = Vertex::attribute_descriptions();
+        let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder()
+            .vertex_binding_descriptions(binding_descriptions)
+            .vertex_attribute_descriptions(&attribute_descriptions);
 
         // Input Assembly State
         let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder()
@@ -727,13 +830,7 @@ impl App {
         // Color Blend State
         let attachments = &[vk::PipelineColorBlendAttachmentState::builder()
             .color_write_mask(vk::ColorComponentFlags::all())
-            .blend_enable(false)
-            .src_color_blend_factor(vk::BlendFactor::ONE) // Optional
-            .dst_color_blend_factor(vk::BlendFactor::ZERO) // Optional
-            .color_blend_op(vk::BlendOp::ADD) // Optional
-            .src_alpha_blend_factor(vk::BlendFactor::ONE) // Optional
-            .dst_alpha_blend_factor(vk::BlendFactor::ZERO) // Optional
-            .alpha_blend_op(vk::BlendOp::ADD)];
+            .blend_enable(false)];
         let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
             .logic_op_enable(false)
             .logic_op(vk::LogicOp::COPY)
@@ -744,6 +841,7 @@ impl App {
         let layout_info = vk::PipelineLayoutCreateInfo::builder();
         data.pipeline_layout = device.create_pipeline_layout(&layout_info, None)?;
 
+        // Create
         let stages = &[vert_stage, frag_stage];
         let graphics_info = vk::GraphicsPipelineCreateInfo::builder()
             .stages(stages)
@@ -816,12 +914,51 @@ impl App {
 
             device.cmd_begin_render_pass(*buffer, &render_pass_info, vk::SubpassContents::INLINE);
             device.cmd_bind_pipeline(*buffer, vk::PipelineBindPoint::GRAPHICS, data.pipeline);
-            device.cmd_draw(*buffer, 3, 1, 0, 0);
+            device.cmd_bind_vertex_buffers(*buffer, 0, &[data.vertex_buffer], &[0]);
+            device.cmd_draw(*buffer, VERTICES.len() as u32, 1, 0, 0);
             device.cmd_end_render_pass(*buffer);
 
             device.end_command_buffer(*buffer)?;
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+#[must_use]
+pub struct Vertex {
+    pos: glm::Vec2,
+    color: glm::Vec3,
+}
+
+impl Vertex {
+    fn new(pos: glm::Vec2, color: glm::Vec3) -> Self {
+        Self { pos, color }
+    }
+
+    fn binding_description() -> vk::VertexInputBindingDescription {
+        vk::VertexInputBindingDescription::builder()
+            .binding(0)
+            .stride(size_of::<Vertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX)
+            .build()
+    }
+
+    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+        let pos = vk::VertexInputAttributeDescription::builder()
+            .binding(0)
+            .location(0) // points to shader.vert location
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(0)
+            .build();
+        let color = vk::VertexInputAttributeDescription::builder()
+            .binding(0)
+            .location(1) // points to shader.vert location
+            .format(vk::Format::R32G32B32_SFLOAT)
+            .offset(size_of::<glm::Vec2>() as u32)
+            .build();
+        [pos, color]
     }
 }
 
@@ -898,22 +1035,4 @@ impl SwapchainSupport {
                 .get_physical_device_surface_present_modes_khr(physical_device, data.surface)?,
         })
     }
-}
-
-extern "system" fn debug_callback(
-    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
-    msg_type: vk::DebugUtilsMessageTypeFlagsEXT,
-    data: *const vk::DebugUtilsMessengerCallbackDataEXT,
-    _: *mut c_void,
-) -> vk::Bool32 {
-    let message = unsafe { CStr::from_ptr((*data).message) }.to_string_lossy();
-    match severity {
-        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => log::error!("({:?}) {}", msg_type, message),
-        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => {
-            log::warn!("({:?}) {}", msg_type, message)
-        }
-        vk::DebugUtilsMessageSeverityFlagsEXT::INFO => log::debug!("({:?}) {}", msg_type, message),
-        _ => log::trace!("({:?}) {}", msg_type, message),
-    }
-    vk::FALSE
 }

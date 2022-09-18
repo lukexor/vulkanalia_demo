@@ -38,11 +38,13 @@ const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 lazy_static! {
     static ref VERTICES: Vec<Vertex> = vec![
-        Vertex::new(glm::vec2(0.0, -0.5), glm::vec3(1.0, 0.0, 0.0)),
-        Vertex::new(glm::vec2(0.5, 0.5), glm::vec3(0.0, 1.0, 0.0)),
-        Vertex::new(glm::vec2(-0.5, 0.5), glm::vec3(0.0, 0.0, 1.0)),
+        Vertex::new(glm::vec2(-0.5, -0.5), glm::vec3(1.0, 0.0, 0.0)),
+        Vertex::new(glm::vec2(0.5, -0.5), glm::vec3(0.0, 1.0, 0.0)),
+        Vertex::new(glm::vec2(0.5, 0.5), glm::vec3(0.0, 0.0, 1.0)),
+        Vertex::new(glm::vec2(-0.5, 0.5), glm::vec3(1.0, 1.0, 1.0)),
     ];
 }
+const INDICES: &[u16] = &[0, 1, 2, 2, 3, 0];
 
 fn main() -> Result<()> {
     pretty_env_logger::init();
@@ -151,6 +153,8 @@ struct AppData {
     framebuffers: Vec<vk::Framebuffer>,
     vertex_buffer: vk::Buffer,
     vertex_buffer_memory: vk::DeviceMemory,
+    index_buffer: vk::Buffer,
+    index_buffer_memory: vk::DeviceMemory,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
     // Sync Objects
@@ -384,12 +388,14 @@ impl App {
             destination: vk::Buffer,
             size: vk::DeviceSize,
         ) -> Result<()> {
+            // Allocate
             let command_allocate_info = vk::CommandBufferAllocateInfo::builder()
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_pool(data.command_pool)
                 .command_buffer_count(1);
             let command_buffer = device.allocate_command_buffers(&command_allocate_info)?[0];
 
+            // Commands
             let command_begin_info = vk::CommandBufferBeginInfo::builder()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             device.begin_command_buffer(command_buffer, &command_begin_info)?;
@@ -398,12 +404,14 @@ impl App {
             device.cmd_copy_buffer(command_buffer, source, destination, &[regions]);
             device.end_command_buffer(command_buffer)?;
 
+            // Submit
             let command_buffers = &[command_buffer];
             let submit_info = vk::SubmitInfo::builder().command_buffers(command_buffers);
 
             device.queue_submit(data.graphics_queue, &[submit_info], vk::Fence::null())?;
             device.queue_wait_idle(data.graphics_queue)?;
 
+            // Cleanup
             device.free_command_buffers(data.command_pool, command_buffers);
 
             Ok(())
@@ -426,7 +434,7 @@ impl App {
                 vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
             )?;
 
-            // Copy
+            // Copy Staging
             let memory =
                 device.map_memory(staging_buffer_memory, 0, size, vk::MemoryMapFlags::empty())?;
             std::ptr::copy_nonoverlapping(VERTICES.as_ptr(), memory.cast(), VERTICES.len());
@@ -444,8 +452,55 @@ impl App {
             data.vertex_buffer = vertex_buffer;
             data.vertex_buffer_memory = vertex_buffer_memory;
 
+            // Copy Vertex
             copy_buffer(device, data, staging_buffer, vertex_buffer, size)?;
 
+            // Cleanup
+            device.destroy_buffer(staging_buffer, None);
+            device.free_memory(staging_buffer_memory, None);
+
+            Ok(())
+        }
+
+        unsafe fn create_index_buffer(
+            instance: &Instance,
+            device: &Device,
+            data: &mut AppData,
+        ) -> Result<()> {
+            let size = (size_of::<u16>() * INDICES.len()) as u64;
+
+            // Staging Buffer
+            let (staging_buffer, staging_buffer_memory) = create_buffer(
+                instance,
+                device,
+                data,
+                size,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+            )?;
+
+            // Copy Staging
+            let memory =
+                device.map_memory(staging_buffer_memory, 0, size, vk::MemoryMapFlags::empty())?;
+            std::ptr::copy_nonoverlapping(INDICES.as_ptr(), memory.cast(), INDICES.len());
+            device.unmap_memory(staging_buffer_memory);
+
+            // Index Buffer
+            let (index_buffer, index_buffer_memory) = create_buffer(
+                instance,
+                device,
+                data,
+                size,
+                vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )?;
+            data.index_buffer = index_buffer;
+            data.index_buffer_memory = index_buffer_memory;
+
+            // Copy Index
+            copy_buffer(device, data, staging_buffer, index_buffer, size)?;
+
+            // Cleanup
             device.destroy_buffer(staging_buffer, None);
             device.free_memory(staging_buffer_memory, None);
 
@@ -497,6 +552,7 @@ impl App {
         Self::create_framebuffers(&device, &mut data)?;
         create_command_pool(&instance, &device, &mut data, &indices)?;
         create_vertex_buffer(&instance, &device, &mut data)?;
+        create_index_buffer(&instance, &device, &mut data)?;
         Self::create_command_buffers(&device, &mut data)?;
         create_sync_objects(&device, &mut data)?;
 
@@ -623,6 +679,8 @@ impl App {
 
         self.destroy_swapchain();
 
+        self.device.destroy_buffer(self.data.index_buffer, None);
+        self.device.free_memory(self.data.index_buffer_memory, None);
         self.device.destroy_buffer(self.data.vertex_buffer, None);
         self.device
             .free_memory(self.data.vertex_buffer_memory, None);
@@ -984,7 +1042,8 @@ impl App {
             device.cmd_begin_render_pass(*buffer, &render_pass_info, vk::SubpassContents::INLINE);
             device.cmd_bind_pipeline(*buffer, vk::PipelineBindPoint::GRAPHICS, data.pipeline);
             device.cmd_bind_vertex_buffers(*buffer, 0, &[data.vertex_buffer], &[0]);
-            device.cmd_draw(*buffer, VERTICES.len() as u32, 1, 0, 0);
+            device.cmd_bind_index_buffer(*buffer, data.index_buffer, 0, vk::IndexType::UINT16);
+            device.cmd_draw_indexed(*buffer, INDICES.len() as u32, 1, 0, 0, 0);
             device.cmd_end_render_pass(*buffer);
 
             device.end_command_buffer(*buffer)?;

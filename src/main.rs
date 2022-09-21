@@ -9,7 +9,10 @@ use thiserror::Error;
 use vulkanalia::{
     loader::{LibloadingLoader, LIBRARY},
     prelude::v1_0::*,
-    vk::{ExtDebugUtilsExtension, InstanceCreateFlags, KhrSurfaceExtension, KhrSwapchainExtension},
+    vk::{
+        DescriptorType, ExtDebugUtilsExtension, ExtImageViewMinLodExtension, InstanceCreateFlags,
+        KhrSurfaceExtension, KhrSwapchainExtension,
+    },
     window as vk_window,
 };
 use winit::{
@@ -40,10 +43,26 @@ const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 lazy_static! {
     static ref VERTICES: Vec<Vertex> = vec![
-        Vertex::new(glm::vec2(-0.5, -0.5), glm::vec3(1.0, 0.0, 0.0)),
-        Vertex::new(glm::vec2(0.5, -0.5), glm::vec3(0.0, 1.0, 0.0)),
-        Vertex::new(glm::vec2(0.5, 0.5), glm::vec3(0.0, 0.0, 1.0)),
-        Vertex::new(glm::vec2(-0.5, 0.5), glm::vec3(1.0, 1.0, 1.0)),
+        Vertex::new(
+            glm::vec2(-0.5, -0.5),
+            glm::vec3(1.0, 0.0, 0.0),
+            glm::vec2(1.0, 0.0)
+        ),
+        Vertex::new(
+            glm::vec2(0.5, -0.5),
+            glm::vec3(0.0, 1.0, 0.0),
+            glm::vec2(0.0, 0.0)
+        ),
+        Vertex::new(
+            glm::vec2(0.5, 0.5),
+            glm::vec3(0.0, 0.0, 1.0),
+            glm::vec2(0.0, 1.0)
+        ),
+        Vertex::new(
+            glm::vec2(-0.5, 0.5),
+            glm::vec3(1.0, 1.0, 1.0),
+            glm::vec2(1.0, 1.0)
+        ),
     ];
 }
 
@@ -192,9 +211,11 @@ struct AppData {
     descriptor_sets: Vec<vk::DescriptorSet>,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
-    // TExtures
+    // Textures
     texture_image: vk::Image,
     texture_image_memory: vk::DeviceMemory,
+    texture_image_view: vk::ImageView,
+    texture_sampler: vk::Sampler,
     // Sync Objects
     image_available_semaphor: Vec<vk::Semaphore>,
     render_finished_semaphor: Vec<vk::Semaphore>,
@@ -297,6 +318,11 @@ impl App {
                     return Err(anyhow!(SuitabilityError("Insufficient swapchain support.")));
                 }
 
+                let features = instance.get_physical_device_features(physical_device);
+                if features.sampler_anisotropy != vk::TRUE {
+                    return Err(anyhow!(SuitabilityError("No ssampler anisotropy.")));
+                }
+
                 Ok(indices)
             }
 
@@ -346,7 +372,7 @@ impl App {
                 .collect::<Vec<_>>();
 
             // Features
-            let features = vk::PhysicalDeviceFeatures::builder();
+            let features = vk::PhysicalDeviceFeatures::builder().sampler_anisotropy(true);
 
             // Create
             let device_info = vk::DeviceCreateInfo::builder()
@@ -388,6 +414,8 @@ impl App {
         Self::create_framebuffers(&device, &mut data)?;
         Self::create_command_pool(&instance, &device, &mut data, &indices)?;
         Self::create_texture_image(&instance, &device, &mut data)?;
+        Self::create_texture_image_view(&device, &mut data)?;
+        Self::create_texture_sampler(&device, &mut data)?;
         Self::create_vertex_buffer(&instance, &device, &mut data)?;
         Self::create_index_buffer(&instance, &device, &mut data)?;
         Self::create_uniform_buffers(&instance, &device, &mut data)?;
@@ -650,23 +678,23 @@ impl App {
             };
         let command_buffer = Self::begin_single_time_cmd(device, data)?;
 
-        let subresource = vk::ImageSubresourceRange::builder()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .base_mip_level(0)
-            .level_count(1)
-            .base_array_layer(0)
-            .layer_count(1);
-
         let barrier = vk::ImageMemoryBarrier::builder()
             .old_layout(old_layout)
             .new_layout(new_layout)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(image)
-            .subresource_range(subresource)
+            .subresource_range(
+                vk::ImageSubresourceRange::builder()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
             .src_access_mask(src_access_mask)
             .dst_access_mask(dst_access_mask);
-        //
+
         device.cmd_pipeline_barrier(
             command_buffer,
             src_stage_mask,
@@ -889,6 +917,9 @@ impl App {
             .free_memory(self.data.texture_image_memory, None);
         self.device.destroy_image(self.data.texture_image, None);
         self.device
+            .destroy_image_view(self.data.texture_image_view, None);
+        self.device.destroy_sampler(self.data.texture_sampler, None);
+        self.device
             .destroy_command_pool(self.data.command_pool, None);
         self.device
             .destroy_descriptor_set_layout(self.data.descriptor_set_layout, None);
@@ -1007,28 +1038,7 @@ impl App {
         data.swapchain_image_views = data
             .swapchain_images
             .iter()
-            .map(|&i| {
-                let image_view_info = vk::ImageViewCreateInfo::builder()
-                    .image(i)
-                    .view_type(vk::ImageViewType::_2D)
-                    .format(data.swapchain_format)
-                    .components(
-                        vk::ComponentMapping::builder()
-                            .r(vk::ComponentSwizzle::IDENTITY)
-                            .g(vk::ComponentSwizzle::IDENTITY)
-                            .b(vk::ComponentSwizzle::IDENTITY)
-                            .a(vk::ComponentSwizzle::IDENTITY),
-                    )
-                    .subresource_range(
-                        vk::ImageSubresourceRange::builder()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .base_mip_level(0)
-                            .level_count(1)
-                            .base_array_layer(0)
-                            .layer_count(1),
-                    );
-                device.create_image_view(&image_view_info, None)
-            })
+            .map(|&image| Self::create_image_view(device, image, data.swapchain_format))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(())
     }
@@ -1082,7 +1092,13 @@ impl App {
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::VERTEX);
 
-        let bindings = &[ubo_binding];
+        let sampler_binding = vk::DescriptorSetLayoutBinding::builder()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+
+        let bindings = &[ubo_binding, sampler_binding];
         let descriptor_set_info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(bindings);
 
         data.descriptor_set_layout =
@@ -1358,6 +1374,53 @@ impl App {
         Ok(())
     }
 
+    unsafe fn create_image_view(
+        device: &Device,
+        image: vk::Image,
+        format: vk::Format,
+    ) -> Result<vk::ImageView> {
+        let image_view_info = vk::ImageViewCreateInfo::builder()
+            .image(image)
+            .view_type(vk::ImageViewType::_2D)
+            .format(format)
+            .subresource_range(
+                vk::ImageSubresourceRange::builder()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            );
+        Ok(device.create_image_view(&image_view_info, None)?)
+    }
+
+    unsafe fn create_texture_image_view(device: &Device, data: &mut AppData) -> Result<()> {
+        data.texture_image_view =
+            Self::create_image_view(device, data.texture_image, vk::Format::R8G8B8A8_SRGB)?;
+        Ok(())
+    }
+
+    unsafe fn create_texture_sampler(device: &Device, data: &mut AppData) -> Result<()> {
+        let sampler_info = vk::SamplerCreateInfo::builder()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .anisotropy_enable(true)
+            .max_anisotropy(16.0)
+            .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
+            .unnormalized_coordinates(false)
+            .compare_enable(false)
+            .compare_op(vk::CompareOp::ALWAYS)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .mip_lod_bias(0.0)
+            .min_lod(0.0)
+            .max_lod(0.0);
+        data.texture_sampler = device.create_sampler(&sampler_info, None)?;
+        Ok(())
+    }
+
     unsafe fn create_sync_objects(device: &Device, data: &mut AppData) -> Result<()> {
         let semaphor_info = vk::SemaphoreCreateInfo::builder();
         let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
@@ -1406,11 +1469,15 @@ impl App {
 
     unsafe fn create_descriptor_pool(device: &Device, data: &mut AppData) -> Result<()> {
         let count = data.swapchain_images.len() as u32;
+
         let ubo_size = vk::DescriptorPoolSize::builder()
             .type_(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(count);
+        let sampler_size = vk::DescriptorPoolSize::builder()
+            .type_(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(count);
 
-        let pool_sizes = &[ubo_size];
+        let pool_sizes = &[ubo_size, sampler_size];
         let descriptor_pool_info = vk::DescriptorPoolCreateInfo::builder()
             .pool_sizes(pool_sizes)
             .max_sets(count);
@@ -1444,7 +1511,24 @@ impl App {
                 .dst_array_element(0)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(buffer_info);
-            device.update_descriptor_sets(&[ubo_write], &[] as &[vk::CopyDescriptorSet]);
+
+            let descriptor_image_info = vk::DescriptorImageInfo::builder()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(data.texture_image_view)
+                .sampler(data.texture_sampler);
+
+            let image_info = &[descriptor_image_info];
+            let sampler_write = vk::WriteDescriptorSet::builder()
+                .dst_set(data.descriptor_sets[i])
+                .dst_binding(1)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(image_info);
+
+            device.update_descriptor_sets(
+                &[ubo_write, sampler_write],
+                &[] as &[vk::CopyDescriptorSet],
+            );
         }
         Ok(())
     }
@@ -1504,11 +1588,16 @@ impl App {
 struct Vertex {
     pos: glm::Vec2,
     color: glm::Vec3,
+    tex_coord: glm::Vec2,
 }
 
 impl Vertex {
-    fn new(pos: glm::Vec2, color: glm::Vec3) -> Self {
-        Self { pos, color }
+    fn new(pos: glm::Vec2, color: glm::Vec3, tex_coord: glm::Vec2) -> Self {
+        Self {
+            pos,
+            color,
+            tex_coord,
+        }
     }
 
     fn binding_description() -> vk::VertexInputBindingDescription {
@@ -1519,7 +1608,7 @@ impl Vertex {
             .build()
     }
 
-    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 3] {
         let pos = vk::VertexInputAttributeDescription::builder()
             .binding(0)
             .location(0) // points to shader.vert location
@@ -1532,7 +1621,13 @@ impl Vertex {
             .format(vk::Format::R32G32B32_SFLOAT)
             .offset(size_of::<glm::Vec2>() as u32)
             .build();
-        [pos, color]
+        let tex_coord = vk::VertexInputAttributeDescription::builder()
+            .binding(0)
+            .location(2) // points to shader.vert location
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset((size_of::<glm::Vec2>() + size_of::<glm::Vec3>()) as u32)
+            .build();
+        [pos, color, tex_coord]
     }
 }
 

@@ -69,7 +69,7 @@ macro_rules! timeEnd {
 
 fn main() -> Result<()> {
     if env::var("RUST_LOG").is_err() {
-        env::set_var("RUST_LOG", "debug");
+        env::set_var("RUST_LOG", "info");
     }
 
     pretty_env_logger::init();
@@ -186,6 +186,8 @@ struct AppData {
     depth_image: vk::Image,
     depth_image_memory: vk::DeviceMemory,
     depth_image_view: vk::ImageView,
+    // Mipmap
+    mip_levels: u32,
     // Textures
     texture_image: vk::Image,
     texture_image_memory: vk::DeviceMemory,
@@ -651,6 +653,7 @@ impl App {
         _format: vk::Format,
         old_layout: vk::ImageLayout,
         new_layout: vk::ImageLayout,
+        mip_levels: u32,
     ) -> Result<()> {
         let (src_access_mask, dst_access_mask, src_stage_mask, dst_stage_mask) =
             match (old_layout, new_layout) {
@@ -684,7 +687,7 @@ impl App {
                 vk::ImageSubresourceRange::builder()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
                     .base_mip_level(0)
-                    .level_count(1)
+                    .level_count(mip_levels)
                     .base_array_layer(0)
                     .layer_count(1),
             )
@@ -891,7 +894,7 @@ impl App {
         // Model / View / Projection
         let model = glm::rotate(
             &glm::identity(),
-            time * glm::radians(&glm::vec1(90.0))[0],
+            time * glm::radians(&glm::vec1(10.0))[0],
             &glm::vec3(0.0, 0.0, 1.0),
         );
         let view = glm::look_at(
@@ -1139,6 +1142,7 @@ impl App {
                     image,
                     data.swapchain_format,
                     vk::ImageAspectFlags::COLOR,
+                    1,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1395,6 +1399,7 @@ impl App {
         name: &[u8],
         width: u32,
         height: u32,
+        mip_levels: u32,
         format: vk::Format,
         tiling: vk::ImageTiling,
         usage: vk::ImageUsageFlags,
@@ -1408,7 +1413,7 @@ impl App {
                 height,
                 depth: 1,
             })
-            .mip_levels(1)
+            .mip_levels(mip_levels)
             .array_layers(1)
             .format(format)
             .tiling(tiling)
@@ -1444,6 +1449,145 @@ impl App {
         Ok((image, image_memory))
     }
 
+    unsafe fn generate_mipmaps(
+        instance: &Instance,
+        device: &Device,
+        data: &AppData,
+        image: vk::Image,
+        format: vk::Format,
+        width: u32,
+        height: u32,
+        mip_levels: u32,
+    ) -> Result<()> {
+        // Check Support
+        if !instance
+            .get_physical_device_format_properties(data.physical_device, format)
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+        {
+            return Err(anyhow!(
+                "Texture image format does not support linear blitting!"
+            ));
+        }
+
+        // Mipmap
+
+        let command_buffer = Self::begin_single_time_cmd(device, data)?;
+
+        let mut barrier = vk::ImageMemoryBarrier::builder()
+            .image(image)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .subresource_range(
+                vk::ImageSubresourceRange::builder()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_array_layer(0)
+                    .layer_count(1)
+                    .level_count(1),
+            );
+
+        let mut mip_width = width as i32;
+        let mut mip_height = height as i32;
+
+        for i in 1..mip_levels {
+            barrier.subresource_range.base_mip_level = i - 1;
+            barrier.old_layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+            barrier.new_layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+            barrier.src_access_mask = vk::AccessFlags::TRANSFER_WRITE;
+            barrier.dst_access_mask = vk::AccessFlags::TRANSFER_READ;
+
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[] as &[vk::MemoryBarrier],
+                &[] as &[vk::BufferMemoryBarrier],
+                &[barrier],
+            );
+
+            let blit = vk::ImageBlit::builder()
+                .src_offsets([
+                    vk::Offset3D::default(),
+                    vk::Offset3D {
+                        x: mip_width,
+                        y: mip_height,
+                        z: 1,
+                    },
+                ])
+                .src_subresource(
+                    vk::ImageSubresourceLayers::builder()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(i - 1)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .dst_offsets([
+                    vk::Offset3D::default(),
+                    vk::Offset3D {
+                        x: (mip_width / 2).max(1),
+                        y: (mip_height / 2).max(1),
+                        z: 1,
+                    },
+                ])
+                .dst_subresource(
+                    vk::ImageSubresourceLayers::builder()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(i)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                );
+
+            device.cmd_blit_image(
+                command_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[blit],
+                vk::Filter::LINEAR,
+            );
+
+            barrier.old_layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+            barrier.new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            barrier.src_access_mask = vk::AccessFlags::TRANSFER_READ;
+            barrier.dst_access_mask = vk::AccessFlags::SHADER_READ;
+
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[] as &[vk::MemoryBarrier],
+                &[] as &[vk::BufferMemoryBarrier],
+                &[barrier],
+            );
+
+            mip_width = (mip_width / 2).max(1);
+            mip_height = (mip_height / 2).max(1);
+        }
+
+        barrier.subresource_range.base_mip_level = mip_levels - 1;
+        barrier.old_layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+        barrier.new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        barrier.src_access_mask = vk::AccessFlags::TRANSFER_WRITE;
+        barrier.dst_access_mask = vk::AccessFlags::SHADER_READ;
+
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[] as &[vk::MemoryBarrier],
+            &[] as &[vk::BufferMemoryBarrier],
+            &[barrier],
+        );
+
+        Self::end_single_time_cmd(device, data, command_buffer)?;
+
+        Ok(())
+    }
+
     unsafe fn create_texture_image(
         instance: &Instance,
         device: &Device,
@@ -1462,6 +1606,8 @@ impl App {
         let info = reader.next_frame(&mut pixels)?;
 
         let size = info.buffer_size() as u64;
+
+        data.mip_levels = (info.width.max(info.height) as f32).log2().floor() as u32 + 1;
 
         // Staging Buffer
         let (staging_buffer, staging_buffer_memory) = Self::create_buffer(
@@ -1488,9 +1634,12 @@ impl App {
             b"texture\0",
             info.width,
             info.height,
+            data.mip_levels,
             vk::Format::R8G8B8A8_SRGB,
             vk::ImageTiling::OPTIMAL,
-            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )?;
 
@@ -1505,6 +1654,7 @@ impl App {
             vk::Format::R8G8B8A8_SRGB,
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            data.mip_levels,
         )?;
 
         Self::copy_buffer_to_image(
@@ -1516,16 +1666,19 @@ impl App {
             info.height,
         )?;
 
-        Self::transition_image_layout(
+        // Mipmap
+        Self::generate_mipmaps(
+            instance,
             device,
             data,
             data.texture_image,
             vk::Format::R8G8B8A8_SRGB,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            info.width,
+            info.height,
+            data.mip_levels,
         )?;
 
-        // Cleanip
+        // Cleanup
         device.destroy_buffer(staging_buffer, None);
         device.free_memory(staging_buffer_memory, None);
 
@@ -1537,6 +1690,7 @@ impl App {
         image: vk::Image,
         format: vk::Format,
         aspects: vk::ImageAspectFlags,
+        mip_levels: u32,
     ) -> Result<vk::ImageView> {
         let image_view_info = vk::ImageViewCreateInfo::builder()
             .image(image)
@@ -1546,7 +1700,7 @@ impl App {
                 vk::ImageSubresourceRange::builder()
                     .aspect_mask(aspects)
                     .base_mip_level(0)
-                    .level_count(1)
+                    .level_count(mip_levels)
                     .base_array_layer(0)
                     .layer_count(1),
             );
@@ -1559,6 +1713,7 @@ impl App {
             data.texture_image,
             vk::Format::R8G8B8A8_SRGB,
             vk::ImageAspectFlags::COLOR,
+            data.mip_levels,
         )?;
         Ok(())
     }
@@ -1576,7 +1731,10 @@ impl App {
             .unnormalized_coordinates(false)
             .compare_enable(false)
             .compare_op(vk::CompareOp::ALWAYS)
-            .mipmap_mode(vk::SamplerMipmapMode::LINEAR);
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .min_lod(0.0) // Optional
+            .max_lod(data.mip_levels as f32)
+            .mip_lod_bias(0.0); // Optional
 
         data.texture_sampler = device.create_sampler(&sampler_info, None)?;
 
@@ -1636,6 +1794,7 @@ impl App {
             b"depth\0",
             data.swapchain_extent.width,
             data.swapchain_extent.height,
+            1,
             format,
             vk::ImageTiling::OPTIMAL,
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
@@ -1651,6 +1810,7 @@ impl App {
             data.depth_image,
             format,
             vk::ImageAspectFlags::DEPTH,
+            1,
         )?;
 
         Ok(())

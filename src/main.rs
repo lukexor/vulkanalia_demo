@@ -1,9 +1,16 @@
-use anyhow::{anyhow, Result};
-use lazy_static::lazy_static;
+use anyhow::{anyhow, Context, Result};
 use nalgebra_glm as glm;
 use std::{
-    collections::HashSet, env, ffi::CStr, fs::File, mem::size_of, os::raw::c_void,
-    ptr::copy_nonoverlapping as memcpy, time::Instant,
+    collections::{hash_map::Entry as HashEntry, HashMap, HashSet},
+    env,
+    ffi::CStr,
+    fs::{self, File},
+    hash::{Hash, Hasher},
+    io::BufReader,
+    mem::size_of,
+    os::raw::c_void,
+    ptr::copy_nonoverlapping as memcpy,
+    time::Instant,
 };
 use thiserror::Error;
 use vulkanalia::{
@@ -38,70 +45,23 @@ const DEVICE_EXTENSIONS: &[vk::ExtensionName] = &[
 // The maximum number of frames that can be processed concurrently.
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
-lazy_static! {
-    static ref VERTICES: Vec<Vertex> = vec![
-        Vertex::new(
-            glm::vec3(-0.5, -0.5, 0.0),
-            glm::vec3(1.0, 0.0, 0.0),
-            glm::vec2(1.0, 0.0)
-        ),
-        Vertex::new(
-            glm::vec3(0.5, -0.5, 0.0),
-            glm::vec3(0.0, 1.0, 0.0),
-            glm::vec2(0.0, 0.0)
-        ),
-        Vertex::new(
-            glm::vec3(0.5, 0.5, 0.0),
-            glm::vec3(0.0, 0.0, 1.0),
-            glm::vec2(0.0, 1.0)
-        ),
-        Vertex::new(
-            glm::vec3(-0.5, 0.5, 0.0),
-            glm::vec3(1.0, 1.0, 1.0),
-            glm::vec2(1.0, 1.0)
-        ),
-        Vertex::new(
-            glm::vec3(-0.5, -0.5, -0.5),
-            glm::vec3(1.0, 0.0, 0.0),
-            glm::vec2(1.0, 0.0)
-        ),
-        Vertex::new(
-            glm::vec3(0.5, -0.5, -0.5),
-            glm::vec3(0.0, 1.0, 0.0),
-            glm::vec2(0.0, 0.0)
-        ),
-        Vertex::new(
-            glm::vec3(0.5, 0.5, -0.5),
-            glm::vec3(0.0, 0.0, 1.0),
-            glm::vec2(0.0, 1.0)
-        ),
-        Vertex::new(
-            glm::vec3(-0.5, 0.5, -0.5),
-            glm::vec3(1.0, 1.0, 1.0),
-            glm::vec2(1.0, 1.0)
-        ),
-    ];
-}
-
-const INDICES: &[u16] = &[0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4];
-
 macro_rules! time {
     ($label:ident) => {
         let mut $label = Some(Instant::now());
     };
 }
-macro_rules! timeLog {
-    ($label:ident) => {
-        match $label {
-            Some(label) => log::debug!("{}: {}", stringify!($label), label.elapsed().as_secs_f32()),
-            None => log::warn!("Timer {} does not exist", stringify!($label)),
-        };
-    };
-}
+// macro_rules! timeLog {
+//     ($label:ident) => {
+//         match $label {
+//             Some(label) => log::debug!("{}: {}", stringify!($label), label.elapsed().as_secs_f32()),
+//             None => log::warn!("Timer {} does not exist", stringify!($label)),
+//         };
+//     };
+// }
 macro_rules! timeEnd {
     ($label:ident) => {{
         match $label.take() {
-            Some(label) => log::debug!("{}: {}", stringify!($label), label.elapsed().as_secs_f32()),
+            Some(label) => log::trace!("{}: {}", stringify!($label), label.elapsed().as_secs_f32()),
             None => log::warn!("Timer {} does not exist", stringify!($label)),
         };
     }};
@@ -109,7 +69,7 @@ macro_rules! timeEnd {
 
 fn main() -> Result<()> {
     if env::var("RUST_LOG").is_err() {
-        env::set_var("RUST_LOG", "info");
+        env::set_var("RUST_LOG", "debug");
     }
 
     pretty_env_logger::init();
@@ -118,7 +78,7 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title("Vulkanalia Tutorial")
-        .with_inner_size(LogicalSize::new(1280, 1024))
+        .with_inner_size(LogicalSize::new(1024, 768))
         .build(&event_loop)?;
 
     // App
@@ -199,10 +159,12 @@ struct App {
 #[derive(Default, Debug, Clone)]
 #[must_use]
 struct AppData {
+    // Debug
     messenger: vk::DebugUtilsMessengerEXT,
+    // Surface
     surface: vk::SurfaceKHR,
+    // Device / Queues
     physical_device: vk::PhysicalDevice,
-    // Queues
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
     // Swapchain
@@ -216,27 +178,34 @@ struct AppData {
     descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
-    // Buffers
+    // Framebuffers
     framebuffers: Vec<vk::Framebuffer>,
+    // Command Pool
+    command_pool: vk::CommandPool,
+    // Depth
+    depth_image: vk::Image,
+    depth_image_memory: vk::DeviceMemory,
+    depth_image_view: vk::ImageView,
+    // Textures
+    texture_image: vk::Image,
+    texture_image_memory: vk::DeviceMemory,
+    texture_image_view: vk::ImageView,
+    texture_sampler: vk::Sampler,
+    // Model
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+    // Buffers
     vertex_buffer: vk::Buffer,
     vertex_buffer_memory: vk::DeviceMemory,
     index_buffer: vk::Buffer,
     index_buffer_memory: vk::DeviceMemory,
     uniform_buffers: Vec<vk::Buffer>,
     uniform_buffers_memory: Vec<vk::DeviceMemory>,
+    // Descriptors
     descriptor_pool: vk::DescriptorPool,
     descriptor_sets: Vec<vk::DescriptorSet>,
-    command_pool: vk::CommandPool,
+    // Command Buffers
     command_buffers: Vec<vk::CommandBuffer>,
-    // Textures
-    texture_image: vk::Image,
-    texture_image_memory: vk::DeviceMemory,
-    texture_image_view: vk::ImageView,
-    texture_sampler: vk::Sampler,
-    // Depth
-    depth_image: vk::Image,
-    depth_image_memory: vk::DeviceMemory,
-    depth_image_view: vk::ImageView,
     // Sync Objects
     image_available_semaphor: Vec<vk::Semaphore>,
     render_finished_semaphor: Vec<vk::Semaphore>,
@@ -260,7 +229,7 @@ impl App {
                 .application_version(vk::make_version(1, 0, 0))
                 .engine_name(b"No Engine\0")
                 .engine_version(vk::make_version(1, 0, 0))
-                .api_version(vk::make_version(1, 3, 0));
+                .api_version(vk::make_version(1, 0, 0));
 
             // Layers
             let available_layers = entry
@@ -268,6 +237,7 @@ impl App {
                 .iter()
                 .map(|l| l.layer_name)
                 .collect::<HashSet<_>>();
+
             if VALIDATION_ENABLED && !available_layers.contains(&VALIDATION_LAYER) {
                 return Err(anyhow!("Validation layer requested but not supported."));
             }
@@ -412,6 +382,7 @@ impl App {
         }
 
         log::debug!("creating app");
+
         let loader = LibloadingLoader::new(LIBRARY)?;
         let entry = Entry::new(loader).map_err(|b| anyhow!("{}", b))?;
         let mut data = AppData::default();
@@ -432,15 +403,16 @@ impl App {
         Self::create_render_pass(&instance, &device, &mut data)?;
         Self::create_descriptor_set_layout(&device, &mut data)?;
         Self::create_pipeline(&device, &mut data)?;
-        Self::create_command_pool(&instance, &device, &mut data, &indices)?;
+        Self::create_command_pool(&device, &mut data, &indices)?;
+        Self::create_depth_objects(&instance, &device, &mut data)?;
+        Self::create_framebuffers(&device, &mut data)?;
         Self::create_texture_image(&instance, &device, &mut data)?;
         Self::create_texture_image_view(&device, &mut data)?;
         Self::create_texture_sampler(&device, &mut data)?;
-        Self::create_depth_objects(&instance, &device, &mut data)?;
+        Self::load_model(&mut data)?;
         Self::create_vertex_buffer(&instance, &device, &mut data)?;
         Self::create_index_buffer(&instance, &device, &mut data)?;
         Self::create_uniform_buffers(&instance, &device, &mut data)?;
-        Self::create_framebuffers(&device, &mut data)?;
         Self::create_descriptor_pool(&device, &mut data)?;
         Self::create_descriptor_sets(&device, &mut data)?;
         Self::create_command_buffers(&device, &mut data)?;
@@ -490,8 +462,8 @@ impl App {
 
         let wait_semaphores = &[self.data.image_available_semaphor[self.frame]];
         let wait_stages = &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-        let signal_semaphores = &[self.data.render_finished_semaphor[self.frame]];
         let command_buffers = &[self.data.command_buffers[image_index]];
+        let signal_semaphores = &[self.data.render_finished_semaphor[self.frame]];
         let submit_info = vk::SubmitInfo::builder()
             .wait_semaphores(wait_semaphores)
             .wait_dst_stage_mask(wait_stages)
@@ -501,7 +473,6 @@ impl App {
         self.device.reset_fences(&[in_flight_fence])?;
         self.device
             .queue_submit(self.data.graphics_queue, &[submit_info], in_flight_fence)?;
-        timeEnd!(render_time);
 
         let swapchains = &[self.data.swapchain];
         let image_indices = &[image_index as u32];
@@ -524,6 +495,8 @@ impl App {
             return Err(anyhow!(err));
         }
         self.frame = (self.frame + 1) % MAX_FRAMES_IN_FLIGHT;
+
+        timeEnd!(render_time);
 
         Ok(())
     }
@@ -675,7 +648,7 @@ impl App {
         device: &Device,
         data: &AppData,
         image: vk::Image,
-        format: vk::Format,
+        _format: vk::Format,
         old_layout: vk::ImageLayout,
         new_layout: vk::ImageLayout,
     ) -> Result<()> {
@@ -698,6 +671,7 @@ impl App {
                 ),
                 _ => return Err(anyhow!("Unsupported image layout transition!")),
             };
+
         let command_buffer = Self::begin_single_time_cmd(device, data)?;
 
         let barrier = vk::ImageMemoryBarrier::builder()
@@ -732,12 +706,63 @@ impl App {
         Ok(())
     }
 
+    unsafe fn load_model(data: &mut AppData) -> Result<()> {
+        // Model
+        let mut obj_reader = BufReader::new(File::open(
+            fs::canonicalize("resources/viking_room.obj")
+                .with_context(|| anyhow!("failed to open model obj"))?,
+        )?);
+
+        let (models, _) = tobj::load_obj_buf(
+            &mut obj_reader,
+            &tobj::LoadOptions {
+                triangulate: true,
+                ..Default::default()
+            },
+            |_| Ok((vec![tobj::Material::default()], Default::default())),
+        )?;
+
+        // Vertices / Indices
+
+        let mut unique_vertices = HashMap::new();
+
+        for model in &models {
+            for index in &model.mesh.indices {
+                let pos_offset = (3 * index) as usize;
+                let texcoord_offset = (2 * index) as usize;
+
+                let pos = &model.mesh.positions;
+                let texcoords = &model.mesh.texcoords;
+                let vertex = Vertex {
+                    pos: glm::vec3(pos[pos_offset], pos[pos_offset + 1], pos[pos_offset + 2]),
+                    color: glm::vec3(1.0, 1.0, 1.0),
+                    texcoords: glm::vec2(
+                        texcoords[texcoord_offset],
+                        1.0 - texcoords[texcoord_offset + 1],
+                    ),
+                };
+
+                match unique_vertices.entry(vertex) {
+                    HashEntry::Occupied(entry) => data.indices.push(*entry.get() as u32),
+                    HashEntry::Vacant(entry) => {
+                        let index = data.vertices.len();
+                        entry.insert(index);
+                        data.vertices.push(vertex);
+                        data.indices.push(index as u32);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     unsafe fn create_vertex_buffer(
         instance: &Instance,
         device: &Device,
         data: &mut AppData,
     ) -> Result<()> {
-        let size = (size_of::<Vertex>() * VERTICES.len()) as u64;
+        let size = (size_of::<Vertex>() * data.vertices.len()) as u64;
 
         // Staging Buffer
         let (staging_buffer, staging_buffer_memory) = Self::create_buffer(
@@ -752,7 +777,7 @@ impl App {
         // Copy Staging
         let memory =
             device.map_memory(staging_buffer_memory, 0, size, vk::MemoryMapFlags::empty())?;
-        memcpy(VERTICES.as_ptr(), memory.cast(), VERTICES.len());
+        memcpy(data.vertices.as_ptr(), memory.cast(), data.vertices.len());
         device.unmap_memory(staging_buffer_memory);
 
         // Vertex Buffer
@@ -782,7 +807,8 @@ impl App {
         device: &Device,
         data: &mut AppData,
     ) -> Result<()> {
-        let size = (size_of::<u16>() * INDICES.len()) as u64;
+        // Must match data.indices datatype
+        let size = (size_of::<u32>() * data.indices.len()) as u64;
 
         // Staging Buffer
         let (staging_buffer, staging_buffer_memory) = Self::create_buffer(
@@ -797,7 +823,7 @@ impl App {
         // Copy Staging
         let memory =
             device.map_memory(staging_buffer_memory, 0, size, vk::MemoryMapFlags::empty())?;
-        memcpy(INDICES.as_ptr(), memory.cast(), INDICES.len());
+        memcpy(data.indices.as_ptr(), memory.cast(), data.indices.len());
         device.unmap_memory(staging_buffer_memory);
 
         // Index Buffer
@@ -822,8 +848,35 @@ impl App {
         Ok(())
     }
 
+    unsafe fn create_uniform_buffers(
+        instance: &Instance,
+        device: &Device,
+        data: &mut AppData,
+    ) -> Result<()> {
+        data.uniform_buffers.clear();
+        data.uniform_buffers_memory.clear();
+
+        let size = size_of::<UniformBufferObject>() as u64;
+        for _ in 0..data.swapchain_images.len() {
+            let (uniform_buffer, uniform_buffer_memory) = Self::create_buffer(
+                instance,
+                device,
+                data,
+                size,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+            )?;
+            data.uniform_buffers.push(uniform_buffer);
+            data.uniform_buffers_memory.push(uniform_buffer_memory);
+        }
+
+        Ok(())
+    }
+
     unsafe fn update_uniform_buffer(&self, image_index: usize) -> Result<()> {
         let time = self.start.elapsed().as_secs_f32();
+
+        // Model / View / Projection
         let model = glm::rotate(
             &glm::identity(),
             time * glm::radians(&glm::vec1(90.0))[0],
@@ -845,6 +898,7 @@ impl App {
 
         let ubo = UniformBufferObject { model, view, proj };
 
+        // Copy
         let uniform_buffer_memory = self.data.uniform_buffers_memory[image_index];
         let memory = self.device.map_memory(
             uniform_buffer_memory,
@@ -860,7 +914,6 @@ impl App {
 
     unsafe fn recreate_swapchain(&mut self, window: &Window) -> Result<()> {
         self.device.device_wait_idle()?;
-
         self.destroy_swapchain();
 
         let indices =
@@ -884,14 +937,11 @@ impl App {
         self.data
             .images_in_flight
             .resize(self.data.swapchain_images.len(), vk::Fence::null());
+
         Ok(())
     }
 
     unsafe fn destroy_swapchain(&mut self) {
-        self.device
-            .destroy_image_view(self.data.depth_image_view, None);
-        self.device.free_memory(self.data.depth_image_memory, None);
-        self.device.destroy_image(self.data.depth_image, None);
         self.device
             .free_command_buffers(self.data.command_pool, &self.data.command_buffers);
         self.device
@@ -904,6 +954,10 @@ impl App {
             .uniform_buffers
             .iter()
             .for_each(|&b| self.device.destroy_buffer(b, None));
+        self.device
+            .destroy_image_view(self.data.depth_image_view, None);
+        self.device.free_memory(self.data.depth_image_memory, None);
+        self.device.destroy_image(self.data.depth_image, None);
         self.data
             .framebuffers
             .iter()
@@ -923,7 +977,6 @@ impl App {
         log::debug!("destroying app");
 
         self.device.device_wait_idle().unwrap();
-
         self.destroy_swapchain();
 
         self.data
@@ -943,12 +996,12 @@ impl App {
         self.device
             .free_memory(self.data.vertex_buffer_memory, None);
         self.device.destroy_buffer(self.data.vertex_buffer, None);
+        self.device.destroy_sampler(self.data.texture_sampler, None);
+        self.device
+            .destroy_image_view(self.data.texture_image_view, None);
         self.device
             .free_memory(self.data.texture_image_memory, None);
         self.device.destroy_image(self.data.texture_image, None);
-        self.device
-            .destroy_image_view(self.data.texture_image_view, None);
-        self.device.destroy_sampler(self.data.texture_sampler, None);
         self.device
             .destroy_command_pool(self.data.command_pool, None);
         self.device
@@ -975,7 +1028,7 @@ impl App {
             formats
                 .iter()
                 .find(|f| {
-                    f.format == vk::Format::B8G8R8_SRGB
+                    f.format == vk::Format::B8G8R8A8_SRGB
                         && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
                 })
                 .cloned()
@@ -1095,9 +1148,6 @@ impl App {
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
-        let color_attachment_refs = &[vk::AttachmentReference::builder()
-            .attachment(0)
-            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
 
         let depth_stencil_attachment = vk::AttachmentDescription::builder()
             .format(Self::get_depth_format(instance, data)?)
@@ -1108,11 +1158,15 @@ impl App {
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+        // Subpasses
+        let color_attachment_refs = &[vk::AttachmentReference::builder()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
         let depth_stencil_attachment_ref = vk::AttachmentReference::builder()
             .attachment(1)
             .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 
-        // Subpasses
         let subpasses = &[vk::SubpassDescription::builder()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(color_attachment_refs)
@@ -1250,8 +1304,6 @@ impl App {
             .depth_write_enable(true)
             .depth_compare_op(vk::CompareOp::LESS)
             .depth_bounds_test_enable(false)
-            .min_depth_bounds(0.0) // Optional
-            .max_depth_bounds(1.0) // Optional
             .stencil_test_enable(false);
 
         // Color Blend State
@@ -1314,14 +1366,12 @@ impl App {
     }
 
     unsafe fn create_command_pool(
-        instance: &Instance,
         device: &Device,
         data: &mut AppData,
         indices: &QueueFamilyIndices,
     ) -> Result<()> {
-        let command_pool_info = vk::CommandPoolCreateInfo::builder()
-            .flags(vk::CommandPoolCreateFlags::empty()) // Optional
-            .queue_family_index(indices.graphics);
+        let command_pool_info =
+            vk::CommandPoolCreateInfo::builder().queue_family_index(indices.graphics);
         data.command_pool = device.create_command_pool(&command_pool_info, None)?;
         Ok(())
     }
@@ -1330,6 +1380,7 @@ impl App {
         instance: &Instance,
         device: &Device,
         data: &AppData,
+        name: &[u8],
         width: u32,
         height: u32,
         format: vk::Format,
@@ -1337,6 +1388,7 @@ impl App {
         usage: vk::ImageUsageFlags,
         properties: vk::MemoryPropertyFlags,
     ) -> Result<(vk::Image, vk::DeviceMemory)> {
+        // Image
         let image_info = vk::ImageCreateInfo::builder()
             .image_type(vk::ImageType::_2D)
             .extent(vk::Extent3D {
@@ -1355,13 +1407,23 @@ impl App {
 
         let image = device.create_image(&image_info, None)?;
 
+        // Debug Name
+
+        let debug_info = vk::DebugUtilsObjectNameInfoEXT::builder()
+            .object_type(vk::ObjectType::IMAGE)
+            .object_name(name)
+            .object_handle(image.as_raw());
+        instance.set_debug_utils_object_name_ext(device.handle(), &debug_info)?;
+
+        // Memory
+
         let requirements = device.get_image_memory_requirements(image);
         let memory_info = vk::MemoryAllocateInfo::builder()
             .allocation_size(requirements.size)
             .memory_type_index(Self::get_memory_type_index(
                 instance,
                 data,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                properties,
                 requirements,
             )?);
         let image_memory = device.allocate_memory(&memory_info, None)?;
@@ -1375,16 +1437,21 @@ impl App {
         device: &Device,
         data: &mut AppData,
     ) -> Result<()> {
-        let image = File::open("resources/texture.png")?;
+        // Load
+        let image = File::open(
+            fs::canonicalize("resources/viking_room.png")
+                .with_context(|| anyhow!("failed to open texture"))?,
+        )?;
 
         let decoder = png::Decoder::new(image);
         let mut reader = decoder.read_info()?;
-        let &png::Info { width, height, .. } = reader.info();
 
         let mut pixels = vec![0; reader.output_buffer_size()];
-        reader.next_frame(&mut pixels)?;
+        let info = reader.next_frame(&mut pixels)?;
 
-        let size = pixels.len() as u64;
+        let size = info.buffer_size() as u64;
+
+        // Staging Buffer
         let (staging_buffer, staging_buffer_memory) = Self::create_buffer(
             instance,
             device,
@@ -1394,18 +1461,21 @@ impl App {
             vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
         )?;
 
+        // Copy Staging
         let memory =
             device.map_memory(staging_buffer_memory, 0, size, vk::MemoryMapFlags::empty())?;
 
         memcpy(pixels.as_ptr(), memory.cast(), pixels.len());
         device.unmap_memory(staging_buffer_memory);
 
+        // Texture Buffer
         let (texture_image, texture_image_memory) = Self::create_image(
             instance,
             device,
             data,
-            width,
-            height,
+            b"texture\0",
+            info.width,
+            info.height,
             vk::Format::R8G8B8A8_SRGB,
             vk::ImageTiling::OPTIMAL,
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
@@ -1415,6 +1485,7 @@ impl App {
         data.texture_image = texture_image;
         data.texture_image_memory = texture_image_memory;
 
+        // Transition / Copy
         Self::transition_image_layout(
             device,
             data,
@@ -1429,8 +1500,8 @@ impl App {
             data,
             staging_buffer,
             data.texture_image,
-            width,
-            height,
+            info.width,
+            info.height,
         )?;
 
         Self::transition_image_layout(
@@ -1442,6 +1513,7 @@ impl App {
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         )?;
 
+        // Cleanip
         device.destroy_buffer(staging_buffer, None);
         device.free_memory(staging_buffer_memory, None);
 
@@ -1492,11 +1564,10 @@ impl App {
             .unnormalized_coordinates(false)
             .compare_enable(false)
             .compare_op(vk::CompareOp::ALWAYS)
-            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-            .mip_lod_bias(0.0)
-            .min_lod(0.0)
-            .max_lod(0.0);
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR);
+
         data.texture_sampler = device.create_sampler(&sampler_info, None)?;
+
         Ok(())
     }
 
@@ -1550,6 +1621,7 @@ impl App {
             instance,
             device,
             data,
+            b"depth\0",
             data.swapchain_extent.width,
             data.swapchain_extent.height,
             format,
@@ -1590,31 +1662,6 @@ impl App {
             .iter()
             .map(|_| vk::Fence::null())
             .collect();
-        Ok(())
-    }
-
-    unsafe fn create_uniform_buffers(
-        instance: &Instance,
-        device: &Device,
-        data: &mut AppData,
-    ) -> Result<()> {
-        data.uniform_buffers.clear();
-        data.uniform_buffers_memory.clear();
-
-        let size = size_of::<UniformBufferObject>() as u64;
-        for _ in 0..data.swapchain_images.len() {
-            let (uniform_buffer, uniform_buffer_memory) = Self::create_buffer(
-                instance,
-                device,
-                data,
-                size,
-                vk::BufferUsageFlags::UNIFORM_BUFFER,
-                vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
-            )?;
-            data.uniform_buffers.push(uniform_buffer);
-            data.uniform_buffers_memory.push(uniform_buffer_memory);
-        }
-
         Ok(())
     }
 
@@ -1722,7 +1769,8 @@ impl App {
             device.cmd_begin_render_pass(*buffer, &render_pass_info, vk::SubpassContents::INLINE);
             device.cmd_bind_pipeline(*buffer, vk::PipelineBindPoint::GRAPHICS, data.pipeline);
             device.cmd_bind_vertex_buffers(*buffer, 0, &[data.vertex_buffer], &[0]);
-            device.cmd_bind_index_buffer(*buffer, data.index_buffer, 0, vk::IndexType::UINT16);
+            // Must match data.indices datatype
+            device.cmd_bind_index_buffer(*buffer, data.index_buffer, 0, vk::IndexType::UINT32);
             device.cmd_bind_descriptor_sets(
                 *buffer,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -1731,7 +1779,7 @@ impl App {
                 &[data.descriptor_sets[i]],
                 &[],
             );
-            device.cmd_draw_indexed(*buffer, INDICES.len() as u32, 1, 0, 0, 0);
+            device.cmd_draw_indexed(*buffer, data.indices.len() as u32, 1, 0, 0, 0);
             device.cmd_end_render_pass(*buffer);
 
             device.end_command_buffer(*buffer)?;
@@ -1746,15 +1794,15 @@ impl App {
 struct Vertex {
     pos: glm::Vec3,
     color: glm::Vec3,
-    tex_coord: glm::Vec2,
+    texcoords: glm::Vec2,
 }
 
 impl Vertex {
-    fn new(pos: glm::Vec3, color: glm::Vec3, tex_coord: glm::Vec2) -> Self {
+    fn new(pos: glm::Vec3, color: glm::Vec3, texcoord: glm::Vec2) -> Self {
         Self {
             pos,
             color,
-            tex_coord,
+            texcoords: texcoord,
         }
     }
 
@@ -1777,15 +1825,38 @@ impl Vertex {
             .binding(0)
             .location(1) // points to shader.vert location
             .format(vk::Format::R32G32B32_SFLOAT)
-            .offset(size_of::<glm::Vec2>() as u32)
+            .offset(size_of::<glm::Vec3>() as u32)
             .build();
-        let tex_coord = vk::VertexInputAttributeDescription::builder()
+        let texcoord = vk::VertexInputAttributeDescription::builder()
             .binding(0)
             .location(2) // points to shader.vert location
             .format(vk::Format::R32G32_SFLOAT)
-            .offset((size_of::<glm::Vec2>() + size_of::<glm::Vec3>()) as u32)
+            .offset((size_of::<glm::Vec3>() + size_of::<glm::Vec3>()) as u32)
             .build();
-        [pos, color, tex_coord]
+        [pos, color, texcoord]
+    }
+}
+
+impl PartialEq for Vertex {
+    fn eq(&self, other: &Self) -> bool {
+        self.pos == other.pos && self.color == other.color && self.texcoords == other.texcoords
+    }
+}
+
+// BAD BAD BAD - Eq for f32
+impl Eq for Vertex {}
+
+impl Hash for Vertex {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for pos in &self.pos {
+            pos.to_bits().hash(state);
+        }
+        for color in &self.color {
+            color.to_bits().hash(state);
+        }
+        for texcoord in &self.texcoords {
+            texcoord.to_bits().hash(state);
+        }
     }
 }
 

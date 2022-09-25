@@ -742,6 +742,18 @@ impl App {
                     ),
                 };
 
+                // Guard against NaN and Infinity for our Eq implementation
+                for pos in &vertex.pos {
+                    if !pos.is_finite() {
+                        return Err(anyhow!("vertex position contains NaN or Infinity"));
+                    }
+                }
+                for texcoord in &vertex.texcoords {
+                    if !texcoord.is_finite() {
+                        return Err(anyhow!("vertex texcoords contains NaN or Infinity"));
+                    }
+                }
+
                 match unique_vertices.entry(vertex) {
                     HashEntry::Occupied(entry) => data.indices.push(*entry.get() as u32),
                     HashEntry::Vacant(entry) => {
@@ -1843,7 +1855,7 @@ impl PartialEq for Vertex {
     }
 }
 
-// BAD BAD BAD - Eq for f32
+// Only valid if no NaN or Infinity values
 impl Eq for Vertex {}
 
 impl Hash for Vertex {

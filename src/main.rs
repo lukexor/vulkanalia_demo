@@ -535,10 +535,17 @@ impl App {
     }
 
     unsafe fn update_command_buffer(&mut self, image_index: usize) -> Result<()> {
-        let buffer = self.data.command_buffers[image_index];
-
+        let previous = self.data.command_buffers[image_index];
         self.device
-            .reset_command_buffer(buffer, vk::CommandBufferResetFlags::empty())?;
+            .free_command_buffers(self.data.command_pool, &[previous]);
+
+        let allocate_info = vk::CommandBufferAllocateInfo::builder()
+            .command_pool(self.data.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+
+        let buffer = self.device.allocate_command_buffers(&allocate_info)?[0];
+        self.data.command_buffers[image_index] = buffer;
 
         // Model
         let time = self.start.elapsed().as_secs_f32();
@@ -673,6 +680,7 @@ impl App {
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_pool(data.command_pool)
             .command_buffer_count(1);
+
         let command_buffer = device.allocate_command_buffers(&command_allocate_info)?[0];
 
         // Commands
@@ -1541,7 +1549,7 @@ impl App {
         indices: &QueueFamilyIndices,
     ) -> Result<()> {
         let command_pool_info = vk::CommandPoolCreateInfo::builder()
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
             .queue_family_index(indices.graphics);
         data.command_pool = device.create_command_pool(&command_pool_info, None)?;
         Ok(())
@@ -2103,6 +2111,7 @@ impl App {
             .command_pool(data.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(data.framebuffers.len() as u32);
+
         data.command_buffers = device.allocate_command_buffers(&allocate_info)?;
 
         Ok(())

@@ -919,14 +919,7 @@ impl App {
     }
 
     unsafe fn update_uniform_buffer(&self, image_index: usize) -> Result<()> {
-        let time = self.start.elapsed().as_secs_f32();
-
-        // Model / View / Projection
-        let model = glm::rotate(
-            &glm::identity(),
-            time * glm::radians(&glm::vec1(10.0))[0],
-            &glm::vec3(0.0, 0.0, 1.0),
-        );
+        // View / Projection
         let view = glm::look_at(
             &glm::vec3(2.0, 2.0, 2.0),
             &glm::vec3(0.0, 0.0, 0.0),
@@ -941,7 +934,7 @@ impl App {
         );
         proj[(1, 1)] *= -1.0; // Y-axis is inverted in Vulkan
 
-        let ubo = UniformBufferObject { model, view, proj };
+        let ubo = UniformBufferObject { view, proj };
 
         // Copy
         let uniform_buffer_memory = self.data.uniform_buffers_memory[image_index];
@@ -1382,16 +1375,35 @@ impl App {
         // Color Blend State
         let attachments = &[vk::PipelineColorBlendAttachmentState::builder()
             .color_write_mask(vk::ColorComponentFlags::all())
-            .blend_enable(false)];
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD)];
         let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
             .logic_op_enable(false)
             .logic_op(vk::LogicOp::COPY)
             .attachments(attachments)
             .blend_constants([0.0; 4]);
 
+        // Push Constants
+        let vert_push_constant_ranges = vk::PushConstantRange::builder()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(64); // 16 * 4 byte floats
+        let frag_push_constant_ranges = vk::PushConstantRange::builder()
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .offset(64)
+            .size(4); // 1 * 4 byte float
+
         // Layout
         let set_layouts = &[data.descriptor_set_layout];
-        let layout_info = vk::PipelineLayoutCreateInfo::builder().set_layouts(set_layouts);
+        let push_constant_ranges = &[vert_push_constant_ranges, frag_push_constant_ranges];
+        let layout_info = vk::PipelineLayoutCreateInfo::builder()
+            .set_layouts(set_layouts)
+            .push_constant_ranges(push_constant_ranges);
         data.pipeline_layout = device.create_pipeline_layout(&layout_info, None)?;
 
         // Create
@@ -2007,10 +2019,14 @@ impl App {
             .command_buffer_count(data.framebuffers.len() as u32);
         data.command_buffers = device.allocate_command_buffers(&allocate_info)?;
 
+        // Model
+        let model = glm::rotate(&glm::identity(), 0.0f32, &glm::vec3(0.0, 0.0, 1.0));
+        let (_, model_bytes, _) = model.as_slice().align_to::<u8>();
+
         // Commands
-        for (i, buffer) in data.command_buffers.iter().enumerate() {
+        for (i, &buffer) in data.command_buffers.iter().enumerate() {
             let command_begin_info = vk::CommandBufferBeginInfo::builder();
-            device.begin_command_buffer(*buffer, &command_begin_info)?;
+            device.begin_command_buffer(buffer, &command_begin_info)?;
 
             let color_clear_value = vk::ClearValue {
                 color: vk::ClearColorValue {
@@ -2034,23 +2050,37 @@ impl App {
                 )
                 .clear_values(clear_values);
 
-            device.cmd_begin_render_pass(*buffer, &render_pass_info, vk::SubpassContents::INLINE);
-            device.cmd_bind_pipeline(*buffer, vk::PipelineBindPoint::GRAPHICS, data.pipeline);
-            device.cmd_bind_vertex_buffers(*buffer, 0, &[data.vertex_buffer], &[0]);
+            device.cmd_begin_render_pass(buffer, &render_pass_info, vk::SubpassContents::INLINE);
+            device.cmd_bind_pipeline(buffer, vk::PipelineBindPoint::GRAPHICS, data.pipeline);
+            device.cmd_bind_vertex_buffers(buffer, 0, &[data.vertex_buffer], &[0]);
             // Must match data.indices datatype
-            device.cmd_bind_index_buffer(*buffer, data.index_buffer, 0, vk::IndexType::UINT32);
+            device.cmd_bind_index_buffer(buffer, data.index_buffer, 0, vk::IndexType::UINT32);
             device.cmd_bind_descriptor_sets(
-                *buffer,
+                buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 data.pipeline_layout,
                 0,
                 &[data.descriptor_sets[i]],
                 &[],
             );
-            device.cmd_draw_indexed(*buffer, data.indices.len() as u32, 1, 0, 0, 0);
-            device.cmd_end_render_pass(*buffer);
+            device.cmd_push_constants(
+                buffer,
+                data.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                model_bytes,
+            );
+            device.cmd_push_constants(
+                buffer,
+                data.pipeline_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                64,
+                &0.25f32.to_ne_bytes()[..],
+            );
+            device.cmd_draw_indexed(buffer, data.indices.len() as u32, 1, 0, 0, 0);
+            device.cmd_end_render_pass(buffer);
 
-            device.end_command_buffer(*buffer)?;
+            device.end_command_buffer(buffer)?;
         }
         Ok(())
     }
@@ -2132,7 +2162,6 @@ impl Hash for Vertex {
 #[repr(C)]
 #[must_use]
 struct UniformBufferObject {
-    model: glm::Mat4,
     view: glm::Mat4,
     proj: glm::Mat4,
 }

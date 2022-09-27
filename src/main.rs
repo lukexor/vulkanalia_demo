@@ -490,6 +490,7 @@ impl App {
         }
 
         self.data.images_in_flight[image_index] = in_flight_fence;
+        self.update_command_buffer(image_index)?;
         self.update_uniform_buffer(image_index)?;
 
         let wait_semaphores = &[self.data.image_available_semaphor[self.frame]];
@@ -529,6 +530,90 @@ impl App {
         self.frame = (self.frame + 1) % MAX_FRAMES_IN_FLIGHT;
 
         timeEnd!(render_time);
+
+        Ok(())
+    }
+
+    unsafe fn update_command_buffer(&mut self, image_index: usize) -> Result<()> {
+        let buffer = self.data.command_buffers[image_index];
+
+        self.device
+            .reset_command_buffer(buffer, vk::CommandBufferResetFlags::empty())?;
+
+        // Model
+        let time = self.start.elapsed().as_secs_f32();
+        let model = glm::rotate(
+            &glm::identity(),
+            time * glm::radians(&glm::vec1(20.0))[0],
+            &glm::vec3(0.0, 0.0, 1.0),
+        );
+        let (_, model_bytes, _) = model.as_slice().align_to::<u8>();
+
+        // Commands
+        let command_begin_info = vk::CommandBufferBeginInfo::builder()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        self.device
+            .begin_command_buffer(buffer, &command_begin_info)?;
+
+        let color_clear_value = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        };
+        let depth_clear_value = vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        };
+        let clear_values = &[color_clear_value, depth_clear_value];
+        let render_pass_info = vk::RenderPassBeginInfo::builder()
+            .render_pass(self.data.render_pass)
+            .framebuffer(self.data.framebuffers[image_index])
+            .render_area(
+                vk::Rect2D::builder()
+                    .offset(vk::Offset2D::default())
+                    .extent(self.data.swapchain_extent),
+            )
+            .clear_values(clear_values);
+
+        self.device
+            .cmd_begin_render_pass(buffer, &render_pass_info, vk::SubpassContents::INLINE);
+        self.device
+            .cmd_bind_pipeline(buffer, vk::PipelineBindPoint::GRAPHICS, self.data.pipeline);
+        self.device
+            .cmd_bind_vertex_buffers(buffer, 0, &[self.data.vertex_buffer], &[0]);
+        // Must match data.indices datatype
+        self.device
+            .cmd_bind_index_buffer(buffer, self.data.index_buffer, 0, vk::IndexType::UINT32);
+        self.device.cmd_bind_descriptor_sets(
+            buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.data.pipeline_layout,
+            0,
+            &[self.data.descriptor_sets[image_index]],
+            &[],
+        );
+        self.device.cmd_push_constants(
+            buffer,
+            self.data.pipeline_layout,
+            vk::ShaderStageFlags::VERTEX,
+            0,
+            model_bytes,
+        );
+        self.device.cmd_push_constants(
+            buffer,
+            self.data.pipeline_layout,
+            vk::ShaderStageFlags::FRAGMENT,
+            64,
+            &0.25f32.to_ne_bytes()[..],
+        );
+        self.device
+            .cmd_draw_indexed(buffer, self.data.indices.len() as u32, 1, 0, 0, 0);
+        self.device.cmd_end_render_pass(buffer);
+
+        self.device.end_command_buffer(buffer)?;
 
         Ok(())
     }
@@ -1455,8 +1540,9 @@ impl App {
         data: &mut AppData,
         indices: &QueueFamilyIndices,
     ) -> Result<()> {
-        let command_pool_info =
-            vk::CommandPoolCreateInfo::builder().queue_family_index(indices.graphics);
+        let command_pool_info = vk::CommandPoolCreateInfo::builder()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(indices.graphics);
         data.command_pool = device.create_command_pool(&command_pool_info, None)?;
         Ok(())
     }
@@ -2019,69 +2105,6 @@ impl App {
             .command_buffer_count(data.framebuffers.len() as u32);
         data.command_buffers = device.allocate_command_buffers(&allocate_info)?;
 
-        // Model
-        let model = glm::rotate(&glm::identity(), 0.0f32, &glm::vec3(0.0, 0.0, 1.0));
-        let (_, model_bytes, _) = model.as_slice().align_to::<u8>();
-
-        // Commands
-        for (i, &buffer) in data.command_buffers.iter().enumerate() {
-            let command_begin_info = vk::CommandBufferBeginInfo::builder();
-            device.begin_command_buffer(buffer, &command_begin_info)?;
-
-            let color_clear_value = vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [0.0, 0.0, 0.0, 1.0],
-                },
-            };
-            let depth_clear_value = vk::ClearValue {
-                depth_stencil: vk::ClearDepthStencilValue {
-                    depth: 1.0,
-                    stencil: 0,
-                },
-            };
-            let clear_values = &[color_clear_value, depth_clear_value];
-            let render_pass_info = vk::RenderPassBeginInfo::builder()
-                .render_pass(data.render_pass)
-                .framebuffer(data.framebuffers[i])
-                .render_area(
-                    vk::Rect2D::builder()
-                        .offset(vk::Offset2D::default())
-                        .extent(data.swapchain_extent),
-                )
-                .clear_values(clear_values);
-
-            device.cmd_begin_render_pass(buffer, &render_pass_info, vk::SubpassContents::INLINE);
-            device.cmd_bind_pipeline(buffer, vk::PipelineBindPoint::GRAPHICS, data.pipeline);
-            device.cmd_bind_vertex_buffers(buffer, 0, &[data.vertex_buffer], &[0]);
-            // Must match data.indices datatype
-            device.cmd_bind_index_buffer(buffer, data.index_buffer, 0, vk::IndexType::UINT32);
-            device.cmd_bind_descriptor_sets(
-                buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                data.pipeline_layout,
-                0,
-                &[data.descriptor_sets[i]],
-                &[],
-            );
-            device.cmd_push_constants(
-                buffer,
-                data.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                model_bytes,
-            );
-            device.cmd_push_constants(
-                buffer,
-                data.pipeline_layout,
-                vk::ShaderStageFlags::FRAGMENT,
-                64,
-                &0.25f32.to_ne_bytes()[..],
-            );
-            device.cmd_draw_indexed(buffer, data.indices.len() as u32, 1, 0, 0, 0);
-            device.cmd_end_render_pass(buffer);
-
-            device.end_command_buffer(buffer)?;
-        }
         Ok(())
     }
 }

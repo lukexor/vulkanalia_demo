@@ -21,7 +21,7 @@ use vulkanalia::{
 };
 use winit::{
     dpi::LogicalSize,
-    event::{Event, WindowEvent},
+    event::{ElementState, Event, VirtualKeyCode, WindowEvent},
     event_loop::EventLoop,
     window::{Window, WindowBuilder},
 };
@@ -108,6 +108,18 @@ fn main() -> Result<()> {
                     app.resized = true;
                 }
             }
+            Event::WindowEvent {
+                event: WindowEvent::KeyboardInput { input, .. },
+                ..
+            } => {
+                if input.state == ElementState::Pressed {
+                    match input.virtual_keycode {
+                        Some(VirtualKeyCode::Left) if app.models > 1 => app.models -= 1,
+                        Some(VirtualKeyCode::Right) if app.models < 4 => app.models += 1,
+                        _ => (),
+                    }
+                }
+            }
             Event::LoopDestroyed
             | Event::WindowEvent {
                 event: WindowEvent::CloseRequested | WindowEvent::Destroyed,
@@ -153,6 +165,7 @@ struct App {
     frame: usize,
     resized: bool,
     start: Instant,
+    models: usize,
 }
 
 // Vulkan handles and properties
@@ -186,6 +199,7 @@ struct AppData {
     command_pool: vk::CommandPool,
     command_pools: Vec<vk::CommandPool>,
     command_buffers: Vec<vk::CommandBuffer>,
+    secondary_command_buffers: Vec<Vec<vk::CommandBuffer>>,
     // Depth
     depth_image: vk::Image,
     depth_image_memory: vk::DeviceMemory,
@@ -460,6 +474,7 @@ impl App {
             frame: 0,
             resized: false,
             start: Instant::now(),
+            models: 1,
         })
     }
 
@@ -542,15 +557,6 @@ impl App {
 
         let buffer = self.data.command_buffers[image_index];
 
-        // Model
-        let time = self.start.elapsed().as_secs_f32();
-        let model = glm::rotate(
-            &glm::identity(),
-            time * glm::radians(&glm::vec1(20.0))[0],
-            &glm::vec3(0.0, 0.0, 1.0),
-        );
-        let (_, model_bytes, _) = model.as_slice().align_to::<u8>();
-
         // Commands
         let command_begin_info = vk::CommandBufferBeginInfo::builder()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -580,8 +586,74 @@ impl App {
             )
             .clear_values(clear_values);
 
+        self.device.cmd_begin_render_pass(
+            buffer,
+            &render_pass_info,
+            vk::SubpassContents::SECONDARY_COMMAND_BUFFERS,
+        );
+
+        let secondary_command_buffers = (0..self.models)
+            .map(|i| self.update_secondary_command_buffer(image_index, i))
+            .collect::<Result<Vec<_>, _>>()?;
         self.device
-            .cmd_begin_render_pass(buffer, &render_pass_info, vk::SubpassContents::INLINE);
+            .cmd_execute_commands(buffer, &secondary_command_buffers[..]);
+
+        self.device.cmd_end_render_pass(buffer);
+
+        self.device.end_command_buffer(buffer)?;
+
+        Ok(())
+    }
+
+    unsafe fn update_secondary_command_buffer(
+        &mut self,
+        image_index: usize,
+        model_index: usize,
+    ) -> Result<vk::CommandBuffer> {
+        self.data
+            .secondary_command_buffers
+            .resize_with(image_index + 1, Vec::new);
+        let buffers = &mut self.data.secondary_command_buffers[image_index];
+        while model_index >= buffers.len() {
+            let allocate_info = vk::CommandBufferAllocateInfo::builder()
+                .command_pool(self.data.command_pools[image_index])
+                .level(vk::CommandBufferLevel::SECONDARY)
+                .command_buffer_count(1);
+
+            let buffer = self.device.allocate_command_buffers(&allocate_info)?[0];
+
+            buffers.push(buffer);
+        }
+
+        let buffer = buffers[model_index];
+
+        let inheritance_info = vk::CommandBufferInheritanceInfo::builder()
+            .render_pass(self.data.render_pass)
+            .subpass(0)
+            .framebuffer(self.data.framebuffers[image_index]);
+        let info = vk::CommandBufferBeginInfo::builder()
+            .flags(vk::CommandBufferUsageFlags::RENDER_PASS_CONTINUE)
+            .inheritance_info(&inheritance_info);
+
+        self.device.begin_command_buffer(buffer, &info)?;
+
+        // Model
+        let y = (((model_index % 2) as f32) * 2.5) - 1.25;
+        let z = (((model_index / 2) as f32) * -2.0) + 1.0;
+
+        let model = glm::translate(&glm::identity(), &glm::vec3(0.0, y, z));
+
+        let time = self.start.elapsed().as_secs_f32();
+        let model = glm::rotate(
+            &model,
+            time * glm::radians(&glm::vec1(20.0))[0],
+            &glm::vec3(0.0, 0.0, 1.0),
+        );
+        let (_, model_bytes, _) = model.as_slice().align_to::<u8>();
+
+        let opacity = (model_index + 1) as f32 * 0.25;
+        let opacity_bytes = &opacity.to_ne_bytes()[..];
+
         self.device
             .cmd_bind_pipeline(buffer, vk::PipelineBindPoint::GRAPHICS, self.data.pipeline);
         self.device
@@ -609,15 +681,14 @@ impl App {
             self.data.pipeline_layout,
             vk::ShaderStageFlags::FRAGMENT,
             64,
-            &0.25f32.to_ne_bytes()[..],
+            opacity_bytes,
         );
         self.device
             .cmd_draw_indexed(buffer, self.data.indices.len() as u32, 1, 0, 0, 0);
-        self.device.cmd_end_render_pass(buffer);
 
         self.device.end_command_buffer(buffer)?;
 
-        Ok(())
+        Ok(buffer)
     }
 
     unsafe fn get_memory_type_index(
@@ -1009,7 +1080,7 @@ impl App {
     unsafe fn update_uniform_buffer(&self, image_index: usize) -> Result<()> {
         // View / Projection
         let view = glm::look_at(
-            &glm::vec3(2.0, 2.0, 2.0),
+            &glm::vec3(6.0, 0.0, 2.0),
             &glm::vec3(0.0, 0.0, 0.0),
             &glm::vec3(0.0, 0.0, 1.0),
         );
@@ -2128,6 +2199,8 @@ impl App {
             let buffer = device.allocate_command_buffers(&allocate_info)?[0];
             data.command_buffers.push(buffer);
         }
+
+        data.secondary_command_buffers = vec![vec![]; data.swapchain_images.len()];
 
         Ok(())
     }
